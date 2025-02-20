@@ -1,0 +1,40 @@
+# Project Roadmap for the Raycast Extension with Local MCP Server
+
+## Step 1: MCP Filesystem Server
+- **Objective:** Create a Node.js-based server to access your local files.
+- **Base Directory:** The server will use your Downloads folder (i.e., $HOME/Downloads).
+- **Functionality:**
+  - Recursively scan the Downloads folder to index all files.
+  - Provide a `GET /search` endpoint:
+    - Accepts an optional query parameter `q` to filter files by their name.
+    - Returns a maximum of 50 files for performance.
+  - Provide a `GET /file` endpoint:
+    - Accepts a `path` parameter pointing to a file.
+    - If the file is a PDF, use `pdf-parse` to extract text.
+    - If the file is text-based (e.g., `.txt`, `.md`, `.json`, `.js`), read the content as UTF-8.
+  - **Technologies:** Express, fs/promises, pdf-parse, and Node.js utilities (fs, path).
+
+## Step 2: Raycast Command Extension
+- **Objective:** Build a simple Raycast command using the Raycast AI template.
+- **Functionality:**
+  - Include a search bar at the top for user input.
+  - On input change, send a request to the MCP server's `/search` endpoint to retrieve matching files.
+  - Display the list of files with:
+    - **Title:** File name.
+    - **Accessory Title:** File type (extension without the dot).
+- **Future Enhancements:**
+  - Extend the command to retrieve file content via the `/file` endpoint on file selection.
+  - Integrate Anthropic's API for Q&A on the content of text-based files.
+  - Merge search and Q&A functions into one unified workflow as the project matures.
+
+## Next Steps / Future Phases
+1. **Prototyping and Testing:**
+   - Run the MCP Filesystem server locally (`node server.js`).
+   - Test the search functionality via the Raycast command.
+2. **Add Q&A Functionality:**
+   - Once file search is stable, implement logic to fetch file content.
+   - Integrate with an LLM API (e.g., Anthropic) to provide Q&A on the retrieved content.
+3. **Extension Unification:**
+   - Combine search and Q&A modes in a single effective workflow within the Raycast extension.
+
+*Keep this file updated with any changes to the project scope and planned next steps.* 
