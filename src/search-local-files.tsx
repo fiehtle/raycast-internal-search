@@ -1,17 +1,21 @@
 import { ActionPanel, List, Action, showToast, Toast } from "@raycast/api";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import fetch from "node-fetch";
 import { llmService } from "./services/llm/anthropic";
+import { serverManager } from "./server/index";
 
 interface FileItem {
   name: string;
   path: string;
   type: string;
   preview?: string;
+  size?: number;
 }
 
 interface SearchResponse {
   files: FileItem[];
+  page: number;
+  hasMore: boolean;
 }
 
 // Simple fuzzy search helper
@@ -28,14 +32,53 @@ export default function Command() {
   const [items, setItems] = useState<FileItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [answer, setAnswer] = useState<string | null>(null);
+  const [isServerReady, setIsServerReady] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [hasMore, setHasMore] = useState(false);
+  const [serverPort, setServerPort] = useState<number | null>(null);
 
-  async function handleSearch(text: string) {
+  // Check server status and get port
+  useEffect(() => {
+    const checkServer = async () => {
+      try {
+        if (!serverManager.ready) {
+          setIsLoading(true);
+          await serverManager.start();
+        }
+        setIsServerReady(true);
+        setServerPort(serverManager.getPort());
+      } catch (error) {
+        console.error("Server initialization failed:", error);
+        showToast({
+          style: Toast.Style.Failure,
+          title: "Server initialization failed",
+          message: error instanceof Error ? error.message : "Unknown error"
+        });
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    checkServer();
+  }, []);
+
+  async function handleSearch(text: string, page: number = 1) {
+    if (!isServerReady || !serverPort) {
+      showToast({
+        style: Toast.Style.Failure,
+        title: "Server not ready",
+        message: "Please wait for the server to initialize"
+      });
+      return;
+    }
+
     setIsLoading(true);
-    setItems([]); // Clear previous results immediately
-    setAnswer(null); // Clear previous answer
+    if (page === 1) {
+      setItems([]);
+      setAnswer(null);
+    }
 
     try {
-      // If search is cleared, reset results
       if (!text.trim()) {
         setIsLoading(false);
         return;
@@ -43,16 +86,13 @@ export default function Command() {
 
       console.log("Analyzing query:", text);
       
-      // Use LLM to determine search intent
       const intent = await llmService.classifyIntent(text);
       console.log("Query intent:", intent);
 
-      // Determine search mode based on intent
       const mode = intent.intent === 'ANSWER_QUESTION' ? 'content' : 'title';
       
-      // Always fetch fresh results from the server
       const response = await fetch(
-        `http://localhost:3000/search?q=${encodeURIComponent(text)}&mode=${mode}`
+        `http://localhost:${serverPort}/search?q=${encodeURIComponent(text)}&mode=${mode}&page=${page}`
       );
       
       if (!response.ok) {
@@ -63,7 +103,6 @@ export default function Command() {
       console.log("Received items:", data);
       
       if (intent.intent === 'ANSWER_QUESTION' && data.files.length > 0) {
-        // Get content from relevant files and use LLM to generate an answer
         const relevantContent = data.files
           .map(file => file.preview)
           .filter(Boolean)
@@ -75,12 +114,13 @@ export default function Command() {
         }
       }
       
-      // Apply additional fuzzy filtering on the results
       const filteredItems = data.files.filter(file => 
         mode === 'title' ? fuzzyMatch(file.name.toLowerCase(), text.toLowerCase()) : true
       );
       
-      setItems(filteredItems);
+      setItems(prev => page === 1 ? filteredItems : [...prev, ...filteredItems]);
+      setCurrentPage(data.page);
+      setHasMore(data.hasMore);
     } catch (error) {
       console.error("Search error:", error);
       showToast({
@@ -95,12 +135,10 @@ export default function Command() {
 
   return (
     <List
-      searchBarPlaceholder="Search files... (Press ⌘+Enter to search)"
+      searchBarPlaceholder={isServerReady ? "Search files... (Press ⌘+Enter to search)" : "Initializing server..."}
       isLoading={isLoading}
       onSearchTextChange={(text) => {
         setSearchText(text);
-        // Commented out for now - search on type behavior
-        // handleSearch(text);
       }}
       searchText={searchText}
       throttle={false}
@@ -108,7 +146,7 @@ export default function Command() {
         <ActionPanel>
           <Action
             title="Search"
-            onAction={() => handleSearch(searchText)}
+            onAction={() => handleSearch(searchText, 1)}
             shortcut={{ modifiers: ["cmd"], key: "return" }}
           />
         </ActionPanel>
@@ -130,13 +168,16 @@ export default function Command() {
         </List.Section>
       )}
       
-      <List.Section title="Results" subtitle={items.length > 0 ? `${items.length} files found` : undefined}>
+      <List.Section 
+        title="Results" 
+        subtitle={items.length > 0 ? `${items.length} files found${hasMore ? ' (scroll for more)' : ''}` : undefined}
+      >
         {items.map((file, index) => (
           <List.Item
             key={`${file.path}-${index}`}
             title={file.name}
             subtitle={file.preview}
-            accessoryTitle={file.type}
+            accessoryTitle={`${file.type}${file.size ? ` • ${(file.size / 1024 / 1024).toFixed(1)}MB` : ''}`}
             actions={
               <ActionPanel>
                 <Action
@@ -144,12 +185,11 @@ export default function Command() {
                   onAction={async () => {
                     try {
                       const response = await fetch(
-                        `http://localhost:3000/file?path=${encodeURIComponent(file.path)}`
+                        `http://localhost:${serverPort}/file?path=${encodeURIComponent(file.path)}`
                       );
                       if (!response.ok) {
                         throw new Error("Failed to fetch file content");
                       }
-                      // TODO: Handle file content based on type
                       console.log(`Fetched file: ${file.path}`);
                     } catch (error) {
                       showToast({
@@ -164,6 +204,19 @@ export default function Command() {
             }
           />
         ))}
+        {hasMore && !isLoading && (
+          <List.Item
+            title="Load More..."
+            actions={
+              <ActionPanel>
+                <Action
+                  title="Load More"
+                  onAction={() => handleSearch(searchText, currentPage + 1)}
+                />
+              </ActionPanel>
+            }
+          />
+        )}
       </List.Section>
 
       {searchText !== "" && items.length === 0 && !isLoading && (
