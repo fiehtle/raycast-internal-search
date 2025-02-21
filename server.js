@@ -11,6 +11,24 @@ const port = 3000;
 // Base directory (Downloads folder)
 const baseDir = path.join(process.env.HOME, 'Downloads');
 
+// Read file content based on type
+async function getFileContent(filePath) {
+  try {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === '.pdf') {
+      const dataBuffer = await fsPromises.readFile(filePath);
+      const data = await pdfParse(dataBuffer);
+      return data.text;
+    } else if (ext === '.txt' || ext === '.md' || ext === '.json' || ext === '.js') {
+      return await fsPromises.readFile(filePath, 'utf8');
+    }
+    return null; // Unsupported file type
+  } catch (err) {
+    console.error("Error reading file content:", err);
+    return null;
+  }
+}
+
 // Recursively scan the directory and return all files
 async function scanDir(directory) {
   let results = [];
@@ -36,16 +54,36 @@ async function scanDir(directory) {
   return results;
 }
 
-// Search endpoint for files: GET /search?q=<query>
-// When no query is provided, it returns (up to) 50 files from the Downloads folder.
+// Search endpoint for files: GET /search?q=<query>&mode=<title|content>
 app.get('/search', async (req, res) => {
   const query = req.query.q ? req.query.q.toLowerCase() : '';
+  const mode = req.query.mode || 'title'; // Default to title search
+  
   try {
     const files = await scanDir(baseDir);
-    let filteredFiles = files;
-    if (query) {
+    let filteredFiles = [];
+
+    if (mode === 'content') {
+      // Search through file contents
+      for (const file of files) {
+        const content = await getFileContent(file.path);
+        if (content && content.toLowerCase().includes(query)) {
+          // Add preview of the matching content
+          const contentPreview = content
+            .split('\n')
+            .find(line => line.toLowerCase().includes(query)) || '';
+          
+          filteredFiles.push({
+            ...file,
+            preview: contentPreview.trim().substring(0, 200) // Limit preview length
+          });
+        }
+      }
+    } else {
+      // Title-based search
       filteredFiles = files.filter(file => file.name.toLowerCase().includes(query));
     }
+
     // Return a maximum of 50 files for performance
     res.json({ files: filteredFiles.slice(0, 50) });
   } catch (err) {
