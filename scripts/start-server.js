@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// Load environment variables from .env file
+require('dotenv').config();
+
 // Increase memory limit for the server process
 const v8 = require('v8');
 v8.setFlagsFromString('--max-old-space-size=4096'); // 4GB memory limit
