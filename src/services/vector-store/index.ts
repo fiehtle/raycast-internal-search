@@ -1,6 +1,17 @@
 import path from 'path';
 import fs from 'fs/promises';
-import { environment } from '@raycast/api';
+import sqlite3 from 'sqlite3';
+import { open } from 'sqlite';
+import { HierarchicalNSW } from 'hnswlib-node';
+import OpenAI from 'openai';
+import { mcpService } from '../mcp';
+import os from 'os';
+
+const DATA_DIR = path.join(os.homedir(), '.raycast-search');
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
 interface FileRecord {
   id: string;
@@ -10,24 +21,19 @@ interface FileRecord {
   size: number;
   content_preview: string;
   last_modified: number;
-}
-
-interface SearchIndex {
-  files: { [key: string]: FileRecord };
-  terms: { [key: string]: Set<string> };
+  vector_id?: number;
 }
 
 class SearchStore {
-  private static instance: SearchStore;
+  private static instance: SearchStore | null = null;
   private ready = false;
-  private index: SearchIndex = {
-    files: {},
-    terms: {}
-  };
-  private indexPath: string;
+  private db: any;
+  private index!: HierarchicalNSW;
+  private dbPath: string;
+  private dimension = 1536; // OpenAI's text-embedding-3-small dimension
 
   private constructor() {
-    this.indexPath = path.join(environment.supportPath, 'search_index.json');
+    this.dbPath = path.join(DATA_DIR, 'search.db');
   }
 
   public static getInstance(): SearchStore {
@@ -37,147 +43,200 @@ class SearchStore {
     return SearchStore.instance;
   }
 
-  private async loadIndex(): Promise<void> {
-    try {
-      const data = await fs.readFile(this.indexPath, 'utf8');
-      const savedIndex = JSON.parse(data);
-      
-      // Reconstruct the index with Sets
-      this.index.files = savedIndex.files;
-      this.index.terms = {};
-      
-      for (const [term, fileIds] of Object.entries(savedIndex.terms)) {
-        this.index.terms[term] = new Set(fileIds as string[]);
-      }
-    } catch (err) {
-      // If file doesn't exist or is corrupted, start with empty index
-      this.index = { files: {}, terms: {} };
-    }
+  private async initializeDb(): Promise<void> {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+    console.log(`Initializing SQLite database at ${this.dbPath}`);
+
+    this.db = await open({
+      filename: this.dbPath,
+      driver: sqlite3.Database
+    });
+
+    await this.db.exec(`
+      CREATE TABLE IF NOT EXISTS files (
+        id TEXT PRIMARY KEY,
+        path TEXT NOT NULL,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        content_preview TEXT NOT NULL,
+        last_modified INTEGER NOT NULL,
+        vector_id INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_path ON files(path);
+      CREATE INDEX IF NOT EXISTS idx_name ON files(name);
+    `);
+
+    const count = await this.db.get('SELECT COUNT(*) as count FROM files');
+    console.log(`Database initialized with ${count.count} files`);
   }
 
-  private async saveIndex(): Promise<void> {
+  private async initializeHnsw(): Promise<void> {
     try {
-      // Convert Sets to arrays for JSON serialization
-      const serializableIndex = {
-        files: this.index.files,
-        terms: {} as { [key: string]: string[] }
-      };
-
-      for (const [term, fileIds] of Object.entries(this.index.terms)) {
-        serializableIndex.terms[term] = Array.from(fileIds);
-      }
-
-      await fs.writeFile(this.indexPath, JSON.stringify(serializableIndex));
-    } catch (err) {
-      console.error('Error saving index:', err);
+      // Create HNSW index with cosine similarity
+      this.index = new HierarchicalNSW('cosine', this.dimension);
+      
+      // Initialize with default parameters
+      this.index.initIndex({
+        maxElements: 10000, // Maximum number of elements
+        efConstruction: 200, // Higher is more accurate but slower to build
+        m: 16 // Use lowercase 'm' instead of 'M'
+      });
+      
+      console.log('HNSW index ready for use');
+    } catch (error) {
+      console.error('Failed to initialize HNSW:', error);
+      throw error;
     }
-  }
-
-  private tokenize(text: string): string[] {
-    return text
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, ' ')
-      .split(/\s+/)
-      .filter(term => term.length > 2);
   }
 
   public async initialize(): Promise<void> {
     if (this.ready) return;
 
     try {
-      await this.loadIndex();
+      await this.initializeDb();
+      await this.initializeHnsw();
       this.ready = true;
+      console.log('Search store initialization complete');
     } catch (error) {
       console.error('Failed to initialize search store:', error);
       throw error;
     }
   }
 
-  public async addOrUpdateFile(filePath: string, content: string): Promise<void> {
-    const stats = await fs.stat(filePath);
-    const fileId = Buffer.from(filePath).toString('base64url');
-    
-    // Remove old terms if file exists
-    if (this.index.files[fileId]) {
-      const oldTerms = this.tokenize(this.index.files[fileId].content_preview);
-      for (const term of oldTerms) {
-        this.index.terms[term]?.delete(fileId);
-        if (this.index.terms[term]?.size === 0) {
-          delete this.index.terms[term];
-        }
-      }
+  private async generateEmbedding(text: string): Promise<Float32Array> {
+    try {
+      console.log('Generating embedding for text length:', text.length);
+      const response = await openai.embeddings.create({
+        model: "text-embedding-3-small",
+        input: text,
+        encoding_format: "float"
+      });
+
+      console.log('Got embedding response:', {
+        model: response.model,
+        objectType: response.object,
+        embeddingLength: response.data[0].embedding.length
+      });
+
+      // Convert to Float32Array directly
+      const embedding = new Float32Array(response.data[0].embedding);
+      console.log('Converted to Float32Array:', {
+        length: embedding.length,
+        type: embedding.constructor.name,
+        firstFew: Array.from(embedding.slice(0, 5))
+      });
+
+      return embedding;
+    } catch (error) {
+      console.error('Failed to generate embedding:', error);
+      throw error;
+    }
+  }
+
+  public async addOrUpdateFile(filePath: string): Promise<void> {
+    if (!await mcpService.isTextFile(filePath)) {
+      console.log(`Skipping non-text file: ${filePath}`);
+      return;
     }
 
-    // Add new file record
-    const fileRecord: FileRecord = {
-      id: fileId,
-      path: filePath,
-      name: path.basename(filePath),
-      type: path.extname(filePath).substring(1),
-      size: stats.size,
-      content_preview: content,
-      last_modified: stats.mtimeMs
-    };
-
-    this.index.files[fileId] = fileRecord;
-
-    // Index new terms
-    const terms = this.tokenize(content);
-    for (const term of terms) {
-      if (!this.index.terms[term]) {
-        this.index.terms[term] = new Set();
+    try {
+      const stats = await fs.stat(filePath);
+      const fileId = Buffer.from(filePath).toString('base64url');
+      const { content, size } = await mcpService.readFile(filePath);
+      
+      // Generate embedding and add to HNSW
+      const embedding = await this.generateEmbedding(content);
+      const vectorId = this.index.getCurrentCount();
+      
+      try {
+        // Convert Float32Array to regular array for HNSW
+        const vector = Array.from(embedding);
+        
+        // Add vector to HNSW index
+        this.index.addPoint(vector, vectorId);
+        console.log(`Added vector ${vectorId} to HNSW index (dimension: ${this.dimension})`);
+      } catch (error) {
+        console.error('Failed to add vector to HNSW:', error);
+        throw new Error(`Failed to add vector to HNSW: ${error instanceof Error ? error.message : String(error)}`);
       }
-      this.index.terms[term].add(fileId);
-    }
-
-    // Save index periodically
-    if (Object.keys(this.index.files).length % 100 === 0) {
-      await this.saveIndex();
+      
+      // Store file record
+      const preview = content.slice(0, 1000);
+      await this.db.run(`
+        INSERT OR REPLACE INTO files (
+          id, path, name, type, size, content_preview, last_modified, vector_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        fileId,
+        filePath,
+        path.basename(filePath),
+        path.extname(filePath).substring(1),
+        size,
+        preview,
+        stats.mtimeMs,
+        vectorId
+      ]);
+      
+      console.log(`Indexed file ${filePath} with vector ID ${vectorId}`);
+    } catch (error) {
+      console.error(`Failed to process file ${filePath}:`, error);
+      throw error;
     }
   }
 
   public async search(query: string, limit: number = 50): Promise<FileRecord[]> {
-    const terms = this.tokenize(query);
-    if (terms.length === 0) return [];
+    try {
+      const totalVectors = this.index.getCurrentCount();
+      if (totalVectors === 0) {
+        console.log('No vectors in index');
+        return [];
+      }
 
-    // Find files that match all terms
-    const matchingSets = terms
-      .map(term => this.index.terms[term])
-      .filter(set => set !== undefined);
+      // Generate query embedding
+      const queryEmbedding = await this.generateEmbedding(query);
+      
+      try {
+        // Convert Float32Array to regular array for HNSW
+        const vector = Array.from(queryEmbedding);
+        
+        // Search in HNSW index
+        const results = this.index.searchKnn(vector, Math.min(limit, totalVectors));
+        const { neighbors, distances } = results;
+        
+        if (neighbors.length === 0) {
+          return [];
+        }
 
-    if (matchingSets.length === 0) return [];
+        // Fetch records
+        const placeholders = neighbors.map(() => '?').join(',');
+        const records = await this.db.all(`
+          SELECT * FROM files 
+          WHERE vector_id IN (${placeholders})
+          ORDER BY CASE vector_id ${
+            neighbors.map((l: number, i: number) => `WHEN ${l} THEN ${i}`).join(' ')
+          } END
+          LIMIT ?
+        `, [...neighbors, limit]);
 
-    // Start with the smallest set for better performance
-    matchingSets.sort((a, b) => a.size - b.size);
-    let matches = Array.from(matchingSets[0]);
-
-    // Intersect with other sets
-    for (let i = 1; i < matchingSets.length; i++) {
-      matches = matches.filter(id => matchingSets[i].has(id));
+        return records.map((record: FileRecord, i: number) => ({
+          ...record,
+          score: 1 - distances[i] // Convert cosine distance to similarity score
+        }));
+      } catch (error) {
+        console.error('Failed to search HNSW:', error);
+        throw new Error(`Failed to search HNSW: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } catch (error) {
+      console.error('Error in search:', error);
+      throw error;
     }
-
-    // Convert to file records and sort by last modified
-    return matches
-      .map(id => this.index.files[id])
-      .sort((a, b) => b.last_modified - a.last_modified)
-      .slice(0, limit);
   }
 
   public async removeFile(filePath: string): Promise<void> {
     const fileId = Buffer.from(filePath).toString('base64url');
-    const file = this.index.files[fileId];
-    
-    if (file) {
-      const terms = this.tokenize(file.content_preview);
-      for (const term of terms) {
-        this.index.terms[term]?.delete(fileId);
-        if (this.index.terms[term]?.size === 0) {
-          delete this.index.terms[term];
-        }
-      }
-      delete this.index.files[fileId];
-      await this.saveIndex();
-    }
+    await this.db.run('DELETE FROM files WHERE id = ?', fileId);
+    console.log(`Removed file ${filePath} from database`);
   }
 
   public isReady(): boolean {
