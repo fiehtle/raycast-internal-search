@@ -19,46 +19,33 @@
     "onExtensionUnload": "src/extension.ts#onExtensionUnload"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.36.3",
     "@raycast/api": "^1.91.2",
     "@raycast/utils": "^1.17.0",
-    "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "faiss-node": "^0.5.1",
-    "hnswlib-node": "^3.0.0",
     "node-fetch": "^3.3.2",
-    "openai": "^4.85.3",
     "pdf-parse": "^1.1.1",
-    "sqlite": "^5.1.1",
-    "sqlite3": "^5.1.7"
+    "mammoth": "^1.6.0",
+    "textract": "^2.5.0"
   },
   "devDependencies": {
     "@raycast/eslint-config": "^1.0.11",
     "@types/express": "^5.0.0",
     "@types/node": "20.8.10",
     "@types/react": "18.3.3",
+    "@types/textract": "^2.4.5",
     "eslint": "^8.57.0",
     "prettier": "^3.3.3",
     "ts-node": "^10.9.2",
     "typescript": "^5.4.5"
   },
   "scripts": {
-    "build": "ray build",
-    "build:server": "tsc --project tsconfig.server.json",
+    "build": "ray build -e dist",
     "dev": "ray develop",
+    "build-server": "tsc -p tsconfig.server.json",
+    "start-server": "node --experimental-specifier-resolution=node dist/server/index.js",
     "fix-lint": "ray lint --fix",
-    "lint": "ray lint",
-    "server": "npm run build:server && node --max-old-space-size=4096 scripts/start-server.js",
-    "prepublishOnly": "echo \"\\n\\nIt seems like you are trying to publish the Raycast extension to npm.\\n\\nIf you did intend to publish it to npm, remove the \\`prepublishOnly\\` script and rerun \\`npm publish\\` again.\\nIf you wanted to publish it to the Raycast Store instead, use \\`npm run publish\\` instead.\\n\\n\" && exit 1",
-    "publish": "npx @raycast/api@latest publish"
+    "lint": "ray lint"
   },
-  "preferences": [
-    {
-      "name": "anthropicApiKey",
-      "title": "Anthropic API Key",
-      "description": "Your Anthropic API key for Claude",
-      "type": "password",
-      "required": true
-    }
-  ]
+  "preferences": [],
+  "type": "module"
 }

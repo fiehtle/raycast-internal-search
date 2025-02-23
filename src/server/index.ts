@@ -1,43 +1,135 @@
 import express from 'express';
-import * as net from 'net';
-import { searchStore } from '../services/vector-store';
 import type { Request, Response } from 'express';
+import { mcpService } from '../services/mcp/index.js';
 
 const app = express();
 const BASE_PORT = 49152;
 const MAX_PORT_TRIES = 10;
 let currentPort: number | null = null;
 
+// Fuzzy search function
+function fuzzySearch(text: string, query: string): { match: boolean; score: number } {
+  const textLower = text.toLowerCase();
+  const queryLower = query.toLowerCase();
+  
+  // Exact match gets highest score
+  if (textLower.includes(queryLower)) {
+    return { match: true, score: 1.0 };
+  }
+
+  // Split query into characters for fuzzy matching
+  const chars = queryLower.split('');
+  let lastFoundIndex = -1;
+  let score = 0;
+  let matchCount = 0;
+
+  // Check if characters appear in sequence
+  for (const char of chars) {
+    const index = textLower.indexOf(char, lastFoundIndex + 1);
+    if (index > -1) {
+      matchCount++;
+      // Score is higher for matches closer together
+      score += 1 - (index - lastFoundIndex - 1) / textLower.length;
+      lastFoundIndex = index;
+    }
+  }
+
+  // Calculate final score based on matches and their positions
+  const matchRatio = matchCount / chars.length;
+  const finalScore = matchRatio * (score / chars.length);
+  
+  // Consider it a match if we found at least 60% of characters in sequence
+  return { match: matchRatio >= 0.6, score: finalScore };
+}
+
 // Middleware
 app.use(express.json());
 
 // Routes
-app.post('/index', async (req: Request, res: Response) => {
+app.get('/health', async (req: Request, res: Response) => {
+  res.json({ status: 'ok' });
+});
+
+app.get('/files', async (req: Request, res: Response) => {
   try {
-    const { path } = req.body;
+    const files = await mcpService.listFiles();
+    res.json({ files });
+  } catch (error) {
+    console.error('Error listing files:', error);
+    res.status(500).json({ error: 'Failed to list files' });
+  }
+});
+
+app.get('/file', async (req: Request, res: Response) => {
+  try {
+    const { path } = req.query;
     if (!path || typeof path !== 'string') {
       res.status(400).json({ error: 'Path is required' });
       return;
     }
-    await searchStore.addOrUpdateFile(path);
-    res.json({ success: true });
+    const content = await mcpService.readFile(path);
+    res.json(content);
   } catch (error) {
-    console.error('Error indexing file:', error);
-    res.status(500).json({ error: 'Failed to index file' });
+    console.error('Error reading file:', error);
+    res.status(500).json({ error: 'Failed to read file' });
   }
 });
 
-app.get('/search', async (req: Request, res: Response) => {
+app.post('/search', async (req: Request, res: Response) => {
   try {
-    const query = req.query.q as string;
-    const limit = Number(req.query.limit) || 50;
-    
-    if (!query) {
+    const { query } = req.body;
+    if (!query || typeof query !== 'string') {
       res.status(400).json({ error: 'Search query is required' });
       return;
     }
-    
-    const results = await searchStore.search(query, limit);
+
+    const files = await mcpService.listFiles();
+    const results = [];
+
+    for (const filePath of files) {
+      const fileName = filePath.split('/').pop() || '';
+      const ext = '.' + (filePath.split('.').pop() || '').toLowerCase();
+
+      // Try fuzzy filename match first
+      const fuzzyResult = fuzzySearch(fileName, query);
+      if (fuzzyResult.match) {
+        results.push({
+          path: filePath,
+          name: fileName,
+          type: ext.slice(1).toUpperCase() || 'FILE',
+          matchType: 'filename',
+          score: fuzzyResult.score
+        });
+        continue;
+      }
+
+      // Then try content match for text files
+      if (await mcpService.isTextFile(filePath)) {
+        try {
+          const fileContent = await mcpService.readFile(filePath);
+          // Use both exact and fuzzy matching on content
+          const contentMatch = fileContent.content.toLowerCase().includes(query.toLowerCase());
+          const fuzzyContentResult = fuzzySearch(fileContent.content, query);
+          
+          if (contentMatch || fuzzyContentResult.match) {
+            results.push({
+              path: filePath,
+              name: fileName,
+              type: ext.slice(1).toUpperCase() || 'FILE',
+              content: fileContent.content,
+              matchType: 'content',
+              score: contentMatch ? 1.0 : fuzzyContentResult.score
+            });
+          }
+        } catch (err) {
+          console.error(`Error reading file ${filePath}:`, err);
+        }
+      }
+    }
+
+    // Sort results by score (highest first)
+    results.sort((a, b) => b.score - a.score);
+
     res.json({ results });
   } catch (error) {
     console.error('Error searching:', error);
@@ -45,62 +137,32 @@ app.get('/search', async (req: Request, res: Response) => {
   }
 });
 
-app.delete('/file', async (req: Request, res: Response) => {
-  try {
-    const { path } = req.body;
-    if (!path || typeof path !== 'string') {
-      res.status(400).json({ error: 'Path is required' });
-      return;
-    }
-    await searchStore.removeFile(path);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Error removing file:', error);
-    res.status(500).json({ error: 'Failed to remove file' });
-  }
-});
-
-// Find an available port
-async function findAvailablePort(): Promise<number> {
+// Start the server
+export async function startServer(): Promise<void> {
+  let lastError: Error | null = null;
+  
   for (let port = BASE_PORT; port < BASE_PORT + MAX_PORT_TRIES; port++) {
     try {
       await new Promise<void>((resolve, reject) => {
-        const testServer = net.createServer()
-          .once('error', () => {
-            testServer.close();
+        const server = app.listen(port)
+          .once('listening', () => {
+            currentPort = port;
+            console.log(`File Search Server running on port ${port}`);
             resolve();
           })
-          .once('listening', () => {
-            testServer.close();
-            reject();
-          })
-          .listen(port);
+          .once('error', (err) => {
+            reject(err);
+          });
       });
-      return port;
-    } catch {
+      return; // Server started successfully
+    } catch (error) {
+      lastError = error as Error;
+      console.log(`Port ${port} is in use, trying next port...`);
       continue;
     }
   }
-  throw new Error('No available ports found');
-}
-
-// Start the server
-export async function startServer(): Promise<void> {
-  try {
-    await searchStore.initialize();
-    const port = await findAvailablePort();
-    currentPort = port;
-    
-    await new Promise<void>((resolve) => {
-      app.listen(port, () => {
-        console.log(`Server running on port ${port}`);
-        resolve();
-      });
-    });
-  } catch (error) {
-    console.error('Failed to start server:', error);
-    throw error;
-  }
+  
+  throw new Error(`Failed to start server: ${lastError?.message || 'No available ports'}`);
 }
 
 export function getPort(): number | null {
@@ -108,6 +170,6 @@ export function getPort(): number | null {
 }
 
 // Start server if this file is run directly
-if (require.main === module) {
+if (import.meta.url === new URL(process.argv[1], 'file:').href) {
   startServer().catch(console.error);
 } 
